@@ -36,6 +36,21 @@
 
 直接从Release中下载,安装即可使用.
 
+#### 开发模式启动
+首先, 克隆项目到本地:
+```shell
+git clone https://github.com/Haoke98/DeepClean.git
+```
+其次, 进入项目根目录:
+```shell
+cd DeepClean
+```
+最后, 执行如下脚本:
+```shell
+bash run-dev.sh
+```
+
+
 ### 命令行版本
 
 1. 安装Python环境
