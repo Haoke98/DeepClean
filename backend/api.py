@@ -50,7 +50,7 @@ def get_base_path(path_type: str) -> str:
     return os.path.expanduser(BASE_PATHS.get(path_type, ''))
 
 
-@app.get("/scan")
+@app.get("/api/scan")
 async def scan_files(min_size: int = 10, path: str = "wechat"):
     # 如果已经在扫描，返回错误
     if scanner.scanning:
@@ -91,7 +91,7 @@ async def get_files(sort_by: str = "size", group_by: str = None):
     return sorted(files, key=lambda x: x[sort_by], reverse=True)
 
 
-@app.post("/file/action/{action}")
+@app.post("/api/file/action/{action}")
 async def file_action(action: str, file_data: FileAction):
     # 使用文件的原始完整路径
     full_path = file_data.file_path
@@ -123,7 +123,7 @@ async def file_action(action: str, file_data: FileAction):
 
 
 @deprecated("该API已被最新的系统状态监控API:monitor所平替,将不再适用!")
-@app.get("/disk-usage")
+@app.get("/api/disk-usage")
 async def get_disk_usage():
     total, used, free = shutil.disk_usage("/")
     return {
@@ -134,7 +134,7 @@ async def get_disk_usage():
     }
 
 
-@app.get("/monitor")
+@app.get("/api/monitor")
 async def get_system_monitor():
     # 磁盘使用情况
     disk = psutil.disk_usage("/")
@@ -167,12 +167,12 @@ async def get_system_monitor():
     }
 
 
-@app.get("/scan/progress")
+@app.get("/api/scan/progress")
 async def get_scan_progress():
     return scanner.get_scan_progress()
 
 
-@app.get("/scan/files")
+@app.get("/api/scan/files")
 async def get_current_objects():
     return {
         "files": scanner.get_scanned_objects(),
