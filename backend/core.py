@@ -19,6 +19,7 @@ class FileScanner:
         self.total_dirs = 0
         self.scanned_dirs = 0
         self.scanning = False
+        self.cancel = False
 
     def _is_account_dir(self, dirname):
         """检查是否为账号目录（32位十六进制字符串）"""
@@ -177,7 +178,6 @@ class FileScanner:
     def scan_directory(self, directory_path, min_size_mb=10):
         """扫描指定目录中的大文件"""
         self.scanning = True
-        self.total_dirs = sum([len(dirs) for _, dirs, _ in os.walk(directory_path)])
         self.scanned_dirs = 0
 
         self.size_threshold = min_size_mb * 1024 * 1024
@@ -185,6 +185,8 @@ class FileScanner:
         def get_dir_size(start_path):
             total_size = 0
             for dirpath, dirnames, filenames in os.walk(start_path):
+                if self.cancel:
+                    break
                 for f in filenames:
                     fp = os.path.join(dirpath, f)
                     try:
@@ -195,6 +197,8 @@ class FileScanner:
 
         # 遍历目录
         for root, dirs, files in os.walk(directory_path):
+            if self.cancel:
+                break
             self.scanned_dirs += 1
             # 特殊处理的文件夹列表
             special_dirs = {
@@ -226,6 +230,8 @@ class FileScanner:
 
             # 处理普通文件
             for file in files:
+                if self.cancel:
+                    break
                 if file == ".DS_Store":
                     continue
 
@@ -275,11 +281,13 @@ class FileScanner:
             return None
 
     def get_scan_progress(self):
+        # total_dirs 为 0 时无法计算百分比，用 -1 表示"不确定进度"(前端显示不确定进度条)
+        progress = -1 if self.total_dirs <= 0 else (self.scanned_dirs / self.total_dirs * 100)
         return {
             "total_dirs": self.total_dirs,
             "scanned_dirs": self.scanned_dirs,
             "scanning": self.scanning,
-            "progress": (self.scanned_dirs / self.total_dirs * 100) if self.total_dirs > 0 else 0
+            "progress": progress
         }
 
     def start_scan(self, directory_path, min_size_mb=10):
@@ -290,6 +298,7 @@ class FileScanner:
         logging.debug(f"触发StartScan:{directory_path}")
         self.clear_scan_results()
         self.scanning = True
+        self.cancel = False
 
         def run_scan():
             logging.debug("扫描进程启动")
@@ -300,6 +309,7 @@ class FileScanner:
                 logging.error(f"Scan error: {e}")
             finally:
                 self.scanning = False
+                self.cancel = False
                 logging.debug("扫描进程结束")
 
         # 创建新线程执行扫描
@@ -307,6 +317,18 @@ class FileScanner:
         scan_thread = threading.Thread(target=run_scan)
         scan_thread.daemon = True
         scan_thread.start()
+
+    def cancel_scan(self):
+        """请求取消当前扫描(扫描循环会在下一个目录/文件处停止)"""
+        self.cancel = True
+        logging.debug("收到取消扫描请求")
+
+    def force_reset(self):
+        """强制重置扫描状态并清空结果(用于解围卡死的扫描)"""
+        self.cancel = True
+        self.scanning = False
+        self.clear_scan_results()
+        logging.debug("强制重置扫描状态")
 
     def get_scanned_objects(self):
         """

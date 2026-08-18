@@ -172,6 +172,20 @@ async def get_scan_progress():
     return scanner.get_scan_progress()
 
 
+@app.post("/api/scan/cancel")
+async def cancel_scan():
+    """请求取消当前扫描"""
+    scanner.cancel_scan()
+    return {"status": "cancelling"}
+
+
+@app.post("/api/scan/reset")
+async def reset_scan():
+    """强制重置扫描状态并清空结果(用于解围卡死的扫描)"""
+    scanner.force_reset()
+    return {"status": "reset"}
+
+
 @app.get("/api/scan/files")
 async def get_current_objects():
     return {

@@ -105,13 +105,17 @@
       <el-button type="primary" @click="scanFiles">
         扫描文件
       </el-button>
+      <el-button v-if="scanning" type="warning" :icon="CloseBold" @click="cancelScan">
+        停止扫描
+      </el-button>
     </div>
     <el-progress
         v-if="scanning"
         :percentage="scanProgress"
+        :indeterminate="scanningIndeterminate"
         :status="scanProgress < 100 ? 'processing' : 'success'"
     >
-      <span>已扫描 {{ scannedDirs }} 个目录</span>
+      <span>已扫描 {{ scannedDirs }} 个目录{{ scanningIndeterminate ? '（扫描中，进度不定）' : '' }}</span>
     </el-progress>
 
     <!-- 文件列表 -->
@@ -157,7 +161,7 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue'
 import { ElMessage } from 'element-plus'
-import { View, Folder, Delete } from '@element-plus/icons-vue'
+import { View, Folder, Delete, CloseBold } from '@element-plus/icons-vue'
 import axios from 'axios'
 
 const files = ref([])
@@ -261,27 +265,47 @@ const updateSystemStatus = async () => {
 const scanning = ref(false)
 const scanProgress = ref(0)
 const scannedDirs = ref(0)
+const scanningIndeterminate = ref(false)
 
 // 定期检查扫描进度
 const checkProgress = async () => {
   if (!scanning.value) return
-  
+
   try {
     const { data } = await api.get('/api/scan/progress')
     scanning.value = data.scanning
-    scanProgress.value = data.progress
     scannedDirs.value = data.scanned_dirs
-    
+    scanProgress.value = data.progress < 0 ? 0 : data.progress
+    scanningIndeterminate.value = data.progress < 0 || data.total_dirs === 0
+
     if (scanning.value) {
       // 获取当前已扫描的文件
       const { data: filesData } = await api.get('/api/scan/files')
       files.value = filesData.files
-      
+
       // 继续检查进度
       setTimeout(checkProgress, 1000)
+    } else {
+      // 扫描结束，拉取最终结果
+      scanningIndeterminate.value = false
+      await loadFiles()
     }
   } catch (error) {
     console.error('Failed to get scan progress:', error)
+  }
+}
+
+// 页面加载/刷新后，若后端已有扫描在跑，则重新接上并显示进度与结果
+const resumeIfScanning = async () => {
+  try {
+    const { data } = await api.get('/api/scan/progress')
+    if (data.scanning) {
+      scanning.value = true
+      ElMessage.info('检测到正在进行的扫描，已恢复进度显示')
+      checkProgress()
+    }
+  } catch (error) {
+    console.error('Failed to resume scan:', error)
   }
 }
 
@@ -291,16 +315,34 @@ const scanFiles = async () => {
     scanning.value = true
     scanProgress.value = 0
     scannedDirs.value = 0
-    
+    scanningIndeterminate.value = false
+
     const path = scanPath.value === 'custom' ? customPath.value : scanPath.value
     await api.get(`/api/scan?min_size=${minSize.value}&path=${path}`)
-    
+
     // 开始检查进度
     checkProgress()
   } catch (error) {
     console.error('Scan error:', error)
-    ElMessage.error('扫描失败')
     scanning.value = false
+    const status = error.response?.status
+    const detail = error.response?.data?.detail
+    if (status === 400 && detail === 'Scan already in progress') {
+      ElMessage.warning('已有扫描正在进行，已为你恢复进度显示')
+      await resumeIfScanning()
+    } else {
+      ElMessage.error('扫描失败: ' + (detail || error.message || '未知错误'))
+    }
+  }
+}
+
+const cancelScan = async () => {
+  try {
+    await api.post('/api/scan/cancel')
+    ElMessage.info('正在停止扫描...')
+  } catch (error) {
+    console.error('Cancel scan error:', error)
+    ElMessage.error('停止扫描失败')
   }
 }
 
@@ -335,6 +377,7 @@ const handleAction = async (action, file) => {
 onMounted(() => {
   loadFiles()
   updateSystemStatus()
+  resumeIfScanning()
   // 每5秒更新一次系统状态
   setInterval(updateSystemStatus, 5000)
 })
