@@ -86,6 +86,9 @@ async def scan_files(min_size: int = 10, path: str = "wechat"):
     }
 
 
+# 前端统一通过 /api 前缀访问后端(后端直接监听 5173, 不走 vite 代理),
+# 因此文件列表路由也需要 /api 前缀, 与 /api/scan 等其他路由保持一致
+@app.get("/api/files")
 @app.get("/files")
 async def get_files(sort_by: str = "size", group_by: str = None):
     files = scanner.large_files
