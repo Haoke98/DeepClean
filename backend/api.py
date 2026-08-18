@@ -34,7 +34,6 @@ class FileAction(BaseModel):
 
 # TODO: 这个映射表,也可以在服务器上进行维护
 BASE_PATHS = {
-    'system': '/',
     'user': os.path.expanduser('~'),
     'wechat': '~/Library/Containers/com.tencent.xinWeChat/Data',
     'photos': '~/Pictures',
@@ -44,6 +43,14 @@ BASE_PATHS = {
     'pip': '~/Library/Caches/pip',  # FIXME: 这里的PIP可能需要特殊处理, 因为Anaconda的情况下可能存在多个缓存目录
     'google': '~/Library/Caches/Google'
 }
+
+# 系统级扫描: 扫一组系统级缓存/日志/临时目录, 避免直接扫整个根目录 '/' (无界且危险)
+SYSTEM_SCAN_DIRS = [
+    '/Library/Caches',       # 系统级缓存
+    '/Library/Logs',         # 系统日志(可能包含大文件)
+    '/private/var/tmp',      # 系统临时文件
+    '/private/var/folders',  # 用户/进程的临时与沙盒数据
+]
 
 
 def get_base_path(path_type: str) -> str:
@@ -56,12 +63,15 @@ async def scan_files(min_size: int = 10, path: str = "wechat"):
     if scanner.scanning:
         raise HTTPException(status_code=400, detail="Scan already in progress")
     try:
-        if path == "wechat":
+        if path == "system":
+            # 系统级扫描: 多个系统缓存/临时目录(有界且安全), 而非整个根目录 '/'
+            scanner.start_multi_scan(SYSTEM_SCAN_DIRS, min_size_mb=min_size)
+        elif path == "wechat":
             # scanner.scan_message_files(min_size_mb=min_size)
             scanner.start_scan(BASE_PATHS[path], min_size_mb=min_size)
         elif path == "photos":
             scanner.scan_photos_library(min_size_mb=min_size)
-        elif path in ["user", "system", "photos", "yarn", "jetbrains", "lark", "google", "pip"]:
+        elif path in ["user", "photos", "yarn", "jetbrains", "lark", "google", "pip"]:
             scanner.start_scan(BASE_PATHS[path], min_size_mb=min_size)
         elif os.path.exists(path):
             scanner.start_scan(path, min_size_mb=min_size)

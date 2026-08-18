@@ -7,9 +7,7 @@ export default defineConfig({
   plugins: [
     vue(),
     electron({
-      main: {
-        entry: 'electron/main.js'
-      }
+      entry: 'electron/main.js'
     })
   ],
   resolve: {
@@ -30,11 +28,6 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
-    assetsDir: 'assets',
-    rollupOptions: {
-      input: {
-        main: resolve(__dirname, 'index.html')
-      }
-    }
+    assetsDir: 'assets'
   }
 }) 

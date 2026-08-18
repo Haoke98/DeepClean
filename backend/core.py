@@ -176,10 +176,7 @@ class FileScanner:
         self.accounts = {}
 
     def scan_directory(self, directory_path, min_size_mb=10):
-        """扫描指定目录中的大文件"""
-        self.scanning = True
-        self.scanned_dirs = 0
-
+        """扫描指定目录中的大文件(仅遍历逻辑, 不管理 scanning 标志, 由 start_scan/start_multi_scan 统一管理)"""
         self.size_threshold = min_size_mb * 1024 * 1024
 
         def get_dir_size(start_path):
@@ -264,7 +261,6 @@ class FileScanner:
                 except (OSError, IOError) as e:
                     print(f"Error processing file {file_path}: {e}")
                     continue
-        self.scanning = False
 
     def _calculate_file_md5(self, file_path, block_size=8192):
         """计算文件的MD5值"""
@@ -298,6 +294,7 @@ class FileScanner:
         logging.debug(f"触发StartScan:{directory_path}")
         self.clear_scan_results()
         self.scanning = True
+        self.scanned_dirs = 0
         self.cancel = False
 
         def run_scan():
@@ -313,6 +310,41 @@ class FileScanner:
                 logging.debug("扫描进程结束")
 
         # 创建新线程执行扫描
+        import threading
+        scan_thread = threading.Thread(target=run_scan)
+        scan_thread.daemon = True
+        scan_thread.start()
+
+    def start_multi_scan(self, directory_paths, min_size_mb=10):
+        """异步扫描多个目录(按顺序逐一扫描, 结果合并到 large_files)"""
+        paths = [os.path.expanduser(p) for p in directory_paths]
+        existing = [p for p in paths if os.path.exists(p)]
+        missing = [p for p in paths if not os.path.exists(p)]
+        if missing:
+            logging.warning(f"多目录扫描: 跳过不存在的目录 {missing}")
+        if not existing:
+            raise DirectoryNotExistError(paths[0])
+        logging.debug(f"触发多目录扫描:{existing}")
+        self.clear_scan_results()
+        self.scanning = True
+        self.scanned_dirs = 0
+        self.cancel = False
+
+        def run_scan():
+            logging.debug("多目录扫描进程启动")
+            try:
+                for p in existing:
+                    if self.cancel:
+                        break
+                    self.scan_directory(p, min_size_mb)
+                logging.debug("多目录扫描进程正常结束")
+            except Exception as e:
+                logging.error(f"Scan error: {e}")
+            finally:
+                self.scanning = False
+                self.cancel = False
+                logging.debug("多目录扫描进程结束")
+
         import threading
         scan_thread = threading.Thread(target=run_scan)
         scan_thread.daemon = True
