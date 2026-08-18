@@ -41,9 +41,22 @@
 ```shell
 git clone https://github.com/Haoke98/DeepClean.git
 ```
-其次, 进入项目根目录:
+2. 安装依赖
+进入到项目根目录进行如下操作
 ```shell
-cd DeepClean
+# 安装后端依赖
+pip install -r backend/requirements.txt
+cd frontend && npm install
+
+```
+3. 运行
+启动后端：
+```shell
+python backend/main.py start-ui --port 5173
+```
+启动前端:
+```shell
+npm run dev
 ```
 最后, 执行如下脚本:
 ```shell
