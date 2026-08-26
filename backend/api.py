@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from typing_extensions import deprecated
 
 from core import FileScanner
@@ -11,6 +12,8 @@ import psutil
 import logging
 from utils import logger
 from exceptions import DirectoryNotExistError
+import ai_service
+import json
 
 logger.init('DeepClean-api', console_level=logging.DEBUG)
 app = FastAPI()
@@ -30,6 +33,32 @@ scanner = FileScanner()
 class FileAction(BaseModel):
     file_path: str
     base_path: str = ""
+
+
+class AIAnalyzeRequest(BaseModel):
+    file_path: str
+    file_type: str = ""
+    file_size: int = 0
+    md5: str = ""
+    history: list = []
+
+
+class AIChatRequest(BaseModel):
+    file_path: str
+    file_type: str = ""
+    file_size: int = 0
+    md5: str = ""
+    question: str
+    history: list = []
+
+
+class AIConfigRequest(BaseModel):
+    base_url: str
+    api_key: str = ""
+    model: str
+    temperature: float = 0.3
+    max_tokens: int = 2000
+    timeout: int = 60
 
 
 # TODO: 这个映射表,也可以在服务器上进行维护
@@ -205,3 +234,143 @@ async def get_current_objects():
         "files": scanner.get_scanned_objects(),
         "total_size": sum(f["size"] for f in scanner.large_files)
     }
+
+
+# ==================== AI 分析 ====================
+
+def _size_human(size) -> str:
+    try:
+        size = float(size)
+    except (TypeError, ValueError):
+        return "未知"
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
+
+
+def _find_file_info(data: dict) -> dict:
+    """构造分析用的文件信息(优先用前端传来的字段, 找不到时回退到扫描结果中查找)"""
+    file_info = {
+        "path": data.get("file_path", ""),
+        "type": data.get("file_type") or "未知",
+        "size": data.get("file_size") or 0,
+        "size_human": _size_human(data.get("file_size")),
+        "md5": data.get("md5", ""),
+    }
+    if not file_info["path"]:
+        return file_info
+    # 从扫描结果里补全(前端可能只传了 path)
+    for f in scanner.large_files:
+        if f.get("path") == file_info["path"]:
+            file_info["type"] = data.get("file_type") or f.get("type") or "未知"
+            file_info["size"] = data.get("file_size") or f.get("size") or 0
+            file_info["size_human"] = _size_human(file_info["size"])
+            file_info["md5"] = data.get("md5") or f.get("md5") or ""
+            break
+    return file_info
+
+
+@app.get("/api/ai/config")
+async def get_ai_config():
+    """获取 AI 配置(api_key 脱敏回显)"""
+    config = ai_service.load_ai_config()
+    return {
+        "config": ai_service.mask_config(config),
+        "configured": ai_service.is_configured(config),
+        "has_api_key": bool(config.get("api_key")),
+    }
+
+
+@app.post("/api/ai/config")
+async def update_ai_config(req: AIConfigRequest):
+    """更新并持久化 AI 配置"""
+    # api_key 若为掩码/空值, 保留原值不覆盖
+    current = ai_service.load_ai_config()
+    api_key = req.api_key
+    if not api_key or "****" in api_key:
+        api_key = current.get("api_key", "")
+
+    config = {
+        "base_url": req.base_url.strip(),
+        "api_key": api_key.strip(),
+        "model": req.model.strip(),
+        "temperature": max(0.0, min(2.0, req.temperature)),
+        "max_tokens": max(200, min(16000, req.max_tokens)),
+        "timeout": max(10, min(300, req.timeout)),
+    }
+    if not config["base_url"] or not config["model"]:
+        raise HTTPException(status_code=400, detail="base_url 和 model 不能为空")
+    ai_service.save_ai_config(config)
+    return {"status": "success", "config": ai_service.mask_config(config)}
+
+
+@app.post("/api/ai/test")
+async def test_ai_connection():
+    """测试 AI 连接: 发送一条最小消息, 返回连通性"""
+    config = ai_service.load_ai_config()
+    if not ai_service.is_configured(config):
+        return {"ok": False, "message": "尚未配置 AI 模型"}
+    try:
+        reply = ai_service.AIChatClient(config).chat(
+            [{"role": "user", "content": "回复: OK"}]
+        )
+        return {"ok": True, "message": f"连接成功: {reply[:50]}"}
+    except Exception as e:
+        return {"ok": False, "message": f"连接失败: {e}"}
+
+
+@app.post("/api/ai/analyze")
+async def ai_analyze(req: AIAnalyzeRequest):
+    """AI 分析文件(流式返回 SSE)"""
+    file_info = _find_file_info(dict(req))
+    history = [m for m in (req.history or []) if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+
+    def gen():
+        error_msg = "\n\n> ⚠️ 分析失败: {}"
+        try:
+            for chunk in ai_service.analyze_file_stream(file_info, history):
+                yield f"data: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logging.error(f"AI 分析异常: {e}")
+            yield f"data: {json.dumps({'content': error_msg.format(e)}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/api/ai/chat")
+async def ai_chat(req: AIChatRequest):
+    """基于文件的 AI 对话(流式返回 SSE)"""
+    file_info = _find_file_info(dict(req))
+    history = [m for m in (req.history or []) if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+
+    def gen():
+        error_msg = "\n\n> ⚠️ 对话失败: {}"
+        try:
+            for chunk in ai_service.chat_about_file_stream(file_info, req.question, history):
+                yield f"data: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as gen_error:
+            logging.error(f"AI 对话异常: {gen_error}")
+            yield f"data: {json.dumps({'content': error_msg.format(gen_error)}, ensure_ascii=False)}\n\n"
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/api/ai/analyze/nonstream")
+async def ai_analyze_nonstream(req: AIAnalyzeRequest):
+    """AI 分析文件(非流式, 一次性返回; 便于 curl 调试)"""
+    file_info = _find_file_info(dict(req))
+    history = [m for m in (req.history or []) if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+    config = ai_service.load_ai_config()
+    if not ai_service.is_configured(config):
+        raise HTTPException(status_code=400, detail="尚未配置 AI 模型")
+    messages = [{"role": "system", "content": ai_service.SYSTEM_PROMPT},
+                {"role": "user", "content": ai_service.build_analysis_prompt(file_info)}]
+    try:
+        reply = ai_service.AIChatClient(config).chat(messages)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AI 接口错误: {e}")
+    return {"analysis": reply}

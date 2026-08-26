@@ -128,40 +128,52 @@
           </template>
         </el-table-column>
         <el-table-column prop="relative_path" label="路径" />
-        <el-table-column label="操作" width="250">
+        <el-table-column label="操作" width="310">
           <template #default="scope">
             <el-button-group>
-              <el-button 
+              <el-button
                 @click="handleAction('preview', scope.row)"
                 :icon="View"
                 size="small">
                 预览
               </el-button>
-              <el-button 
+              <el-button
                 @click="handleAction('reveal', scope.row)"
                 :icon="Folder"
                 size="small">
                 打开目录
               </el-button>
-              <el-button 
+              <el-button
                 @click="handleAction('delete', scope.row)"
                 :icon="Delete"
                 type="danger"
                 size="small">
                 删除
               </el-button>
+              <el-button
+                @click="openAiDialog(scope.row)"
+                :icon="MagicStick"
+                type="primary"
+                size="small"
+                plain>
+                AI 分析
+              </el-button>
             </el-button-group>
           </template>
         </el-table-column>
       </el-table>
     </div>
+
+    <!-- AI 分析弹窗 -->
+    <AiDialog v-model="aiDialogVisible" :file="aiCurrentFile" />
   </div>
 </template>
 
 <script setup>
 import { ref, onMounted, computed } from 'vue'
 import { ElMessage } from 'element-plus'
-import { View, Folder, Delete, CloseBold } from '@element-plus/icons-vue'
+import { View, Folder, Delete, CloseBold, MagicStick } from '@element-plus/icons-vue'
+import AiDialog from './AiDialog.vue'
 import axios from 'axios'
 
 const files = ref([])
@@ -234,9 +246,13 @@ const formatSize = (bytes) => {
   return `${size.toFixed(2)} ${units[unitIndex]}`
 }
 
+// API 基础地址: 开发模式(后端直连5173)用 .env.development 里的 VITE_API_BASE;
+// 生产构建默认相对路径, 由 vite preview 代理或 electron 同源加载
+const API_BASE = import.meta.env.VITE_API_BASE ?? ''
+
 // 创建 axios 实例
 const api = axios.create({
-  baseURL: 'http://127.0.0.1:5173',
+  baseURL: API_BASE,
   withCredentials: true
 })
 
@@ -371,6 +387,15 @@ const handleAction = async (action, file) => {
     console.error('Action error:', error.response?.data || error)
     ElMessage.error(`操作失败: ${error.response?.data?.detail || '未知错误'}`)
   }
+}
+
+// AI 分析弹窗
+const aiDialogVisible = ref(false)
+const aiCurrentFile = ref(null)
+
+const openAiDialog = (file) => {
+  aiCurrentFile.value = file
+  aiDialogVisible.value = true
 }
 
 // 组件挂载时启动定时器
