@@ -149,7 +149,7 @@ class AIChatClient:
     def chat(self, messages: list) -> str:
         """非流式: 一次性返回完整回复"""
         url = chat_url(self.config["base_url"])
-        with httpx.Client(timeout=self.config.get("timeout", 60)) as client:
+        with httpx.Client(timeout=self.config.get("timeout", 60), trust_env=False) as client:
             resp = client.post(url, json=self._payload(messages), headers=self._headers())
             resp.raise_for_status()
             data = resp.json()
@@ -159,7 +159,7 @@ class AIChatClient:
         """流式: 逐块 yield 文本增量, 出错时 yield 错误标记"""
         url = chat_url(self.config["base_url"])
         try:
-            with httpx.Client(timeout=self.config.get("timeout", 60)) as client:
+            with httpx.Client(timeout=self.config.get("timeout", 60), trust_env=False) as client:
                 with client.stream(
                     "POST", url, json=self._payload(messages, stream=True), headers=self._headers()
                 ) as resp:
