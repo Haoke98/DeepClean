@@ -676,7 +676,8 @@ def find_residue(layout: MacLayout, bundle_id: str, app_name: str, app_path: str
     except OSError:
         pass
 
-    items.sort(key=lambda x: x["size"], reverse=True)
+    # 强关联(默认勾选)在前、疑似/需确认在后, 组内按体积降序 —— 勾选项集中呈现
+    items.sort(key=lambda x: (0 if x["selected"] else 1, -x["size"]))
     return items
 
 
@@ -709,7 +710,8 @@ def analyze_app(app_path: str, layout: MacLayout | None = None) -> dict:
         "match": "app",
         "selected": True,
     })
-    items.sort(key=lambda x: x["size"], reverse=True)
+    # 与 find_residue 同口径: 强关联(默认勾选)在前、疑似在后, 组内按体积降序
+    items.sort(key=lambda x: (0 if x["selected"] else 1, -x["size"]))
 
     warnings = []
     if not bundle_id:

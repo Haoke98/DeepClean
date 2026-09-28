@@ -55,7 +55,9 @@
         </el-table-column>
         <el-table-column label="大小" width="110" align="right" prop="size" sortable="custom">
           <template #default="{ row }">
-            {{ row.size === null || row.size === undefined ? '-' : formatSize(row.size) }}
+            <div title="仅统计应用本体；深度卸载弹窗会单列全部残留体积">
+              {{ row.size === null || row.size === undefined ? '-' : formatSize(row.size) }}
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="位置" min-width="250">
@@ -101,6 +103,9 @@
             <span class="meta-name">{{ currentApp.name }}</span>
             <el-tag size="small" type="info" effect="plain">v{{ appDetail?.version || currentApp.version || '?' }}</el-tag>
             <span class="meta-bundle">{{ appDetail?.bundle_id || currentApp.bundle_id || '无 Bundle ID' }}</span>
+            <span class="meta-bundle" v-if="currentApp.size != null" title="仅应用本体体积；下方清单单列全部残留">
+              本体 {{ formatSize(currentApp.size) }}
+            </span>
             <span class="meta-path" :title="currentApp.path">{{ currentApp.path }}</span>
           </div>
 
@@ -143,13 +148,19 @@
           <!-- 残留清单 -->
           <div class="items-summary">
             <span>
-              共找到 <b>{{ items.length }}</b> 项 · 合计 <b>{{ formatSize(itemsTotalSize) }}</b>
-              <span v-if="unselectedCount" class="fuzzy-note">
-                · {{ unselectedCount }} 项默认未勾选（疑似/需确认）
-              </span>
+              共找到 <b>{{ items.length }}</b> 项
+              <template v-if="unselectedCount">
+                · 强关联 <b>{{ items.length - unselectedCount }}</b> 项 <b>{{ formatSize(strongSize) }}</b>
+                <span class="fuzzy-note">
+                  · 疑似/需确认 {{ unselectedCount }} 项 {{ formatSize(unselectedSize) }}（默认未勾选）
+                </span>
+              </template>
+              <template v-else>
+                · 合计 <b>{{ formatSize(itemsTotalSize) }}</b>
+              </template>
             </span>
             <span class="sel-info">
-              已勾选 <b>{{ selected.length }}</b> 项 · 合计 <b>{{ formatSize(selectedSize) }}</b>
+              已勾选 <b>{{ selected.length }}</b> 项 · 将删除 <b>{{ formatSize(selectedSize) }}</b>
             </span>
           </div>
 
@@ -365,6 +376,10 @@ const dialogTitle = computed(() =>
 const itemsTotalSize = computed(() => items.value.reduce((s, i) => s + (i.size || 0), 0))
 const selectedSize = computed(() => selected.value.reduce((s, i) => s + (i.size || 0), 0))
 const unselectedCount = computed(() => items.value.filter(i => i.selected === false).length)
+const unselectedSize = computed(() =>
+  items.value.filter(i => i.selected === false).reduce((s, i) => s + (i.size || 0), 0))
+const strongSize = computed(() =>
+  items.value.filter(i => i.selected !== false).reduce((s, i) => s + (i.size || 0), 0))
 
 const doneTitle = computed(() => {
   const s = resultSummary.value

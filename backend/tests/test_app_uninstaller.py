@@ -601,6 +601,9 @@ class TestFuzzyTier(SandboxBase):
                          au.CAT_INSTALLER)
         # 提示语
         self.assertTrue(any("\u7591\u4f3c" in w for w in result["warnings"]), result["warnings"])
+        # 强关联(默认勾选)整体排在疑似项之前
+        flags = [i["selected"] for i in result["items"]]
+        self.assertEqual(flags, sorted(flags, reverse=True), "疑似项应排在强关联之后")
         # 诱饵绝不出现(另一应用/无关文件)
         self.assertNotIn(os.path.join(HOME, "Downloads", "KeepMe.dmg"), by_path)
         self.assertNotIn(os.path.join(os.path.dirname(HOME), "Shared", "PKGgs",
