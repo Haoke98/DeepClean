@@ -28,6 +28,8 @@ app.add_middleware(
         "http://localhost:5173", "http://localhost:5174",
         "http://127.0.0.1:5173", "http://127.0.0.1:5174",
     ],
+    # 前端开发端口是动态的(5173 起被占用则顺延), 放行任意本地端口; $ 锚定防止 127.0.0.1.evil.com 绕过
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d{1,5})?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

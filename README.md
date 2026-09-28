@@ -90,6 +90,7 @@ python backend/main.py start-ui --port 5173
 ```shell
 npm run dev
 ```
+> **开发端口动态分配**：vite 从 5173 起探测空闲端口（被占用则顺延，`strictPort` 保证不静默退避），真实端口通过环境变量 + `frontend/.dev-port` 文件传给 Electron；Electron 加载前会按页面标题校验"这确实是 DeepClean 的页面"，**不会误加载恰好占用 5173 的其它项目**。也可用 `DEEPCLEAN_DEV_PORT=6000 npm run dev` 固定端口；无 GUI 环境可用 `DEEPCLEAN_SKIP_ELECTRON=1` 只起 vite 不拉起 Electron。
 最后, 执行如下脚本:
 ```shell
 bash run-dev.sh
