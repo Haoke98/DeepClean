@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from typing_extensions import deprecated
 
 from core import FileScanner
 import os
+import platform
 import subprocess
 from pydantic import BaseModel
 import shutil
@@ -13,6 +15,7 @@ import logging
 from utils import logger
 from exceptions import DirectoryNotExistError
 import ai_service
+import app_uninstaller
 import json
 
 logger.init('DeepClean-api', console_level=logging.DEBUG)
@@ -62,6 +65,16 @@ class AIConfigRequest(BaseModel):
     temperature: float = 0.3
     max_tokens: int = 2000
     timeout: int = 60
+
+
+class AppUninstallRequest(BaseModel):
+    app_path: str
+    paths: list[str]
+    bundle_id: str = ""
+    app_name: str = ""
+    mode: str = "trash"          # trash=移入废纸篓 | permanent=永久删除
+    stop_processes: bool = True
+    forget_receipts: bool = True
 
 
 # TODO: 这个映射表,也可以在服务器上进行维护
@@ -377,3 +390,58 @@ async def ai_analyze_nonstream(req: AIAnalyzeRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"AI 接口错误: {e}")
     return {"analysis": reply}
+
+
+# ==================== 应用深度卸载 (macOS) ====================
+
+@app.get("/api/apps")
+async def list_installed_apps(q: str = "", with_sizes: bool = True):
+    """列出已安装应用(q 按名称/Bundle ID 后端过滤)"""
+    layout = app_uninstaller.get_layout()
+    apps = await run_in_threadpool(app_uninstaller.list_apps, with_sizes, q, layout)
+    return {
+        "apps": apps,
+        "total": len(apps),
+        "platform": platform.system(),
+        "is_macos": bool(layout.is_macos),
+        "sandbox": bool(os.environ.get(app_uninstaller.SANDBOX_ENV, "").strip()),
+    }
+
+
+@app.get("/api/apps/analyze")
+async def analyze_installed_app(path: str):
+    """分析指定应用的全部残留文件(应用本体 + 关联文件)"""
+    layout = app_uninstaller.get_layout()
+    try:
+        return await run_in_threadpool(app_uninstaller.analyze_app, path, layout)
+    except app_uninstaller.InvalidAppPathError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"应用不存在: {path}")
+
+
+@app.post("/api/apps/uninstall")
+async def uninstall_installed_app(req: AppUninstallRequest):
+    """执行深度卸载: 后端会对每个目标做独立复核, 任一目标不合法则整体拒绝"""
+    layout = app_uninstaller.get_layout()
+    try:
+        return await run_in_threadpool(
+            app_uninstaller.uninstall_app,
+            req.app_path,
+            req.paths,
+            layout=layout,
+            bundle_id=req.bundle_id,
+            app_name=req.app_name,
+            mode=req.mode,
+            stop_processes=req.stop_processes,
+            forget_receipts=req.forget_receipts,
+        )
+    except app_uninstaller.UnsafePathError as e:
+        raise HTTPException(status_code=400, detail={
+            "message": "存在不合法的删除目标, 已整体拒绝执行(未删除任何文件)",
+            "rejected": e.rejected,
+        })
+    except app_uninstaller.InvalidAppPathError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
