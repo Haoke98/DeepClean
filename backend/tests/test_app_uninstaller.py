@@ -34,7 +34,7 @@ APP_NAME = "Foo"
 
 # 沙盒中的绝对路径(在 build_sandbox 里赋值)
 ROOT = HOME = LIB = None
-FOO_APP = BAR_APP = BAZ_APP = NOPLIST_APP = None
+FOO_APP = BAR_APP = BAZ_APP = NOPLIST_APP = ZZ_APP = None
 
 
 def _write(path, data=b"data"):
@@ -54,7 +54,7 @@ def _write_plist(path, info, binary=False):
 
 def build_sandbox():
     """构建仿真 macOS 目录树, 返回 (layout, 关键路径 dict)"""
-    global ROOT, HOME, LIB, FOO_APP, BAR_APP, BAZ_APP, NOPLIST_APP
+    global ROOT, HOME, LIB, FOO_APP, BAR_APP, BAZ_APP, NOPLIST_APP, ZZ_APP
     root = tempfile.mkdtemp(prefix="deepclean_sandbox_", dir=SCRATCH)
     ROOT = root
     HOME = os.path.join(root, "Users", "tester")
@@ -89,6 +89,17 @@ def build_sandbox():
     NOPLIST_APP = os.path.join(root, "Applications", "NoPlist.app")  # 无 Info.plist
     _write(os.path.join(NOPLIST_APP, "Contents", "MacOS", "NoPlist"), b"N" * 100)
 
+    # 带中文本地化名的应用(旧式 key = "value"; 文本格式的 InfoPlist.strings)
+    ZZ_APP = os.path.join(root, "Applications", "ZZTool.app")
+    _write_plist(os.path.join(ZZ_APP, "Contents", "Info.plist"), {
+        "CFBundleIdentifier": "cn.zz.tool",
+        "CFBundleShortVersionString": "5.0.0",
+        "CFBundleName": "ZZTool",
+    })
+    _write(os.path.join(ZZ_APP, "Contents", "MacOS", "ZZTool"), b"Z" * 800)
+    _write(os.path.join(ZZ_APP, "Contents", "Resources", "zh_CN.lproj", "InfoPlist.strings"),
+           b'/* localized names */\nCFBundleDisplayName = "\xe6\xb5\x8b\xe8\xaf\x95\xe5\x8a\xa9\xe6\x89\x8b";\n')
+
     # ---- Foo 的用户级残留 ----
     _write(os.path.join(LIB, "Preferences", "com.vendor.foo.plist"), b"pref")
     _write(os.path.join(LIB, "Preferences", "ByHost", "com.vendor.foo.9CDD-1234.plist"), b"byhost")
@@ -114,6 +125,16 @@ def build_sandbox():
     _write(os.path.join(root, "Library", "LaunchDaemons", "com.vendor.bar.plist"), b"daemon")
     _write(os.path.join(root, "Library", "Application Support", "Bar", "bar.conf"), b"bconf")
 
+    # ---- ZZTool 的残留: 强关联(含新增扫描根) ----
+    _write(os.path.join(LIB, "Preferences", "cn.zz.tool.plist"), b"zzpref")
+    _write(os.path.join(LIB, "Application Support", "CrashReporter", "ZZTool_61A1.plist"), b"zzcrash")
+    _write(os.path.join(root, "private", "var", "folders", "3v", "lbc5xyz", "C",
+                        "cn.zz.tool", "cache.bin"), b"z" * 64)
+    # 模糊(纯包含)才能命中的: 用户数据/安装包 —— 应列出但默认不勾选
+    _write(os.path.join(HOME, "Downloads", "ZZToolDownloads", "pkg.ipa"), b"d" * 128)
+    _write(os.path.join(os.path.dirname(HOME), "Shared", "PKGgs",
+                        "ZZTool_v1_arm64.dmg"), b"m" * 256)
+
     # ---- 诱饵: 名称相近但绝不能被匹配/删除 ----
     _write(os.path.join(LIB, "Preferences", "com.vendor.foo2.plist"), b"decoy1")
     _write(os.path.join(LIB, "Caches", "com.vendor.foobar", "x.bin"), b"decoy2")
@@ -122,12 +143,15 @@ def build_sandbox():
     _write(os.path.join(HOME, ".Keep", "keep.dat"), b"decoy5")
     _write(os.path.join(root, "private", "var", "db", "receipts", "com.vendor.foobar.bom"), b"decoy6")
     _write(os.path.join(HOME, "Documents", "notes.txt"), b"decoy7")
+    _write(os.path.join(HOME, "Downloads", "KeepMe.dmg"), b"decoy8")
+    _write(os.path.join(os.path.dirname(HOME), "Shared", "PKGgs", "Other_v1.dmg"), b"decoy9")
 
     os.makedirs(os.path.join(HOME, ".Trash"), exist_ok=True)
     layout = au.sandbox_layout(root)
     return layout, {
         "root": root, "home": HOME, "lib": LIB,
         "foo": FOO_APP, "bar": BAR_APP, "baz": BAZ_APP, "nopl": NOPLIST_APP,
+        "zz": ZZ_APP,
     }
 
 
@@ -183,6 +207,9 @@ class SandboxBase(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(home, "Documents", "notes.txt")))
         self.assertTrue(os.path.exists(os.path.join(
             root, "private", "var", "db", "receipts", "com.vendor.foobar.bom")))
+        self.assertTrue(os.path.exists(os.path.join(home, "Downloads", "KeepMe.dmg")))
+        self.assertTrue(os.path.exists(os.path.join(
+            os.path.dirname(home), "Shared", "PKGgs", "Other_v1.dmg")))
 
 
 # ==================== 应用发现 ====================
@@ -191,7 +218,7 @@ class TestListApps(SandboxBase):
 
     def test_finds_bundles_and_metadata(self):
         apps = au.list_apps(layout=self.layout)
-        self.assertEqual(len(apps), 4, [a["path"] for a in apps])
+        self.assertEqual(len(apps), 5, [a["path"] for a in apps])
         by_name = {a["name"]: a for a in apps}
 
         foo = by_name["Foo"]
@@ -229,7 +256,7 @@ class TestListApps(SandboxBase):
         self.assertEqual([a["name"] for a in apps], ["Foo"])
 
         apps = au.list_apps(with_sizes=False, layout=self.layout)
-        self.assertEqual(len(apps), 4)
+        self.assertEqual(len(apps), 5)
         self.assertTrue(all(a["size"] is None for a in apps))
 
 
@@ -284,6 +311,8 @@ class TestAnalyze(SandboxBase):
         self.assertIn(daemon, paths)
         self.assertIn(support, paths)
         by_path = {i["path"]: i for i in result["items"]}
+        # 第一层已命中的目录整体列出即可, 其子文件不再重复单列
+        self.assertNotIn(os.path.join(support, "bar.conf"), paths)
         self.assertTrue(by_path[daemon]["needs_admin"])
         self.assertEqual(by_path[daemon]["scope"], "system")
         self.assertEqual(by_path[self.p["bar"]]["scope"], "user")
@@ -474,6 +503,149 @@ class TestUninstall(SandboxBase):
         self.assertIsNotNone(proc.poll())
 
 
+
+
+# ==================== 排序 / 本地化搜索 / 两层匹配 ====================
+
+class TestSortAndSearch(SandboxBase):
+    """按大小排序、按中文本地化名/别名搜索"""
+
+    def setUp(self):
+        super().setUp()
+        # 固定系统语言: 让 zh_CN.lproj 的本地化名成为显示名(Finder 中文环境)
+        os.environ["LANGUAGE"] = "zh_CN.UTF-8"
+        self.addCleanup(os.environ.pop, "LANGUAGE", None)
+
+    def test_default_sort_by_size_desc(self):
+        apps = au.list_apps(layout=self.layout)
+        sizes = [a["size"] for a in apps]
+        self.assertEqual(sizes, sorted(sizes, reverse=True), sizes)
+
+    def test_sort_by_name_and_order_params(self):
+        asc = au.list_apps(sort_by="name", order="asc", layout=self.layout)
+        names = [a["name"] for a in asc]
+        self.assertEqual(names, sorted(names, key=str.lower))
+
+        desc = au.list_apps(sort_by="name", order="desc", layout=self.layout)
+        self.assertEqual([a["name"] for a in desc], sorted(names, key=str.lower, reverse=True))
+
+        size_desc = au.list_apps(sort_by="size", order="desc", layout=self.layout)
+        self.assertEqual([a["size"] for a in size_desc],
+                         sorted((a["size"] for a in size_desc), reverse=True))
+
+        # 非法参数回退到默认(size 降序)
+        fallback = au.list_apps(sort_by="hack", order="up", layout=self.layout)
+        self.assertEqual([a["size"] for a in fallback],
+                         sorted((a["size"] for a in fallback), reverse=True))
+
+    def test_search_by_localized_display_name(self):
+        zz = [a for a in au.list_apps(layout=self.layout) if a["path"] == self.p["zz"]][0]
+        # 系统语言为中文时, 显示名 = InfoPlist.strings 里的本地化名
+        self.assertEqual(zz["name"], "\u6d4b\u8bd5\u52a9\u624b")
+        self.assertIn("ZZTool", zz["aliases"])
+        # 通过 Finder 显示名搜索
+        apps = au.list_apps(q="\u6d4b\u8bd5\u52a9\u624b", layout=self.layout)
+        self.assertEqual([a["path"] for a in apps], [self.p["zz"]])
+        # 通过目录原名 / Bundle ID 搜索
+        self.assertEqual([a["path"] for a in au.list_apps(q="zztool", layout=self.layout)],
+                         [self.p["zz"]])
+        self.assertEqual([a["path"] for a in au.list_apps(q="cn.zz.tool", layout=self.layout)],
+                         [self.p["zz"]])
+        # 不匹配的应用不被带出
+        self.assertEqual(au.list_apps(q="zztool", layout=self.layout).__len__(), 1)
+
+
+class TestFuzzyTier(SandboxBase):
+    """残留匹配分层: 强关联默认勾选 / 关键字模糊疑似默认不勾选 + 新扫描根"""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["LANGUAGE"] = "zh_CN.UTF-8"
+        self.addCleanup(os.environ.pop, "LANGUAGE", None)
+
+    def test_residue_tiers_and_new_roots(self):
+        result = au.analyze_app(self.p["zz"], layout=self.layout)
+        by_path = {i["path"]: i for i in result["items"]}
+
+        strong = [
+            self.p["zz"],                                                    # 应用本体
+            os.path.join(LIB, "Preferences", "cn.zz.tool.plist"),            # 强关联
+            os.path.join(LIB, "Application Support", "CrashReporter",
+                         "ZZTool_61A1.plist"),                               # 二级目录
+            os.path.join(ROOT, "private", "var", "folders", "3v", "lbc5xyz",
+                         "C", "cn.zz.tool"),                                 # 系统临时缓存
+        ]
+        for p in strong:
+            self.assertIn(p, by_path, f"缺少: {p}")
+            self.assertTrue(by_path[p]["selected"], f"强关联应默认勾选: {p}")
+            self.assertNotEqual(by_path[p]["match"], "fuzzy", p)
+
+        # 模糊(纯包含)命中: ZZTool + D 不构成名称边界 → fuzzy, 默认不勾选
+        dl = os.path.join(HOME, "Downloads", "ZZToolDownloads")
+        self.assertIn(dl, by_path)
+        self.assertEqual(by_path[dl]["match"], "fuzzy")
+        self.assertFalse(by_path[dl]["selected"])
+
+        # 安装包: ZZTool_ 构成名称边界(name 命中), 但分类属 NOAUTO → 默认不勾选
+        pkg = os.path.join(os.path.dirname(HOME), "Shared", "PKGgs", "ZZTool_v1_arm64.dmg")
+        self.assertIn(pkg, by_path)
+        self.assertEqual(by_path[pkg]["category"], au.CAT_INSTALLER)
+        self.assertFalse(by_path[pkg]["selected"])
+        fuzzy = [dl, pkg]
+
+        # 分类归属
+        self.assertEqual(by_path[os.path.join(HOME, "Downloads", "ZZToolDownloads")]["category"],
+                         au.CAT_DOWNLOAD)
+        self.assertEqual(by_path[os.path.join(os.path.dirname(HOME), "Shared", "PKGgs",
+                                              "ZZTool_v1_arm64.dmg")]["category"],
+                         au.CAT_INSTALLER)
+        # 提示语
+        self.assertTrue(any("\u7591\u4f3c" in w for w in result["warnings"]), result["warnings"])
+        # 诱饵绝不出现(另一应用/无关文件)
+        self.assertNotIn(os.path.join(HOME, "Downloads", "KeepMe.dmg"), by_path)
+        self.assertNotIn(os.path.join(os.path.dirname(HOME), "Shared", "PKGgs",
+                                      "Other_v1.dmg"), by_path)
+
+    def test_fuzzy_paths_validate_only_inside_roots(self):
+        kw = {"app_path": self.p["zz"], "bundle_id": "cn.zz.tool", "app_name": "ZZTool"}
+        dl = os.path.join(HOME, "Downloads", "ZZToolDownloads")
+        good, reason = au.validate_target(self.layout, dl, **kw)
+        self.assertTrue(good, reason)
+        self.assertIn("\u6a21\u7cca", reason)
+
+        # 同在 Downloads 根内但与该应用无关 → 拒绝
+        self.assertFalse(au.validate_target(
+            self.layout, os.path.join(HOME, "Downloads", "KeepMe.dmg"), **kw)[0])
+        # 根外即使名称命中也拒绝
+        notes = os.path.join(HOME, "Documents", "ZZTool_notes.txt")
+        _write(notes, b"x")
+        self.assertFalse(au.validate_target(self.layout, notes, **kw)[0])
+
+    def test_uninstall_with_fuzzy_selection(self):
+        result = au.analyze_app(self.p["zz"], layout=self.layout)
+        paths = [i["path"] for i in result["items"] if i["selected"]]   # 默认勾选(强关联)
+        fuzzy_path = os.path.join(HOME, "Downloads", "ZZToolDownloads")
+        paths.append(fuzzy_path)                                        # 用户手动勾选疑似项
+
+        out = au.uninstall_app(self.p["zz"], paths, bundle_id="cn.zz.tool",
+                               app_name="ZZTool", mode="trash",
+                               stop_processes=False, layout=self.layout)
+        self.assertEqual(out["status"], "success", out)
+        self.assertEqual(out["removed_count"], len(paths))
+        for p in paths:
+            self.assertFalse(os.path.lexists(p), f"未删除: {p}")
+        self.assert_decoys_intact()
+        # 没勾选的疑似项(安装包)留在原地
+        self.assertTrue(os.path.exists(
+            os.path.join(os.path.dirname(HOME), "Shared", "PKGgs", "ZZTool_v1_arm64.dmg")))
+
+    def test_bar_analysis_has_no_fuzzy_noise(self):
+        """通用分段(>=7字)门槛: 分析 Bar 不得把别的应用目录列为疑似"""
+        result = au.analyze_app(self.p["bar"], layout=self.layout)
+        fuzzy = [i for i in result["items"] if i["match"] == "fuzzy"]
+        self.assertEqual(fuzzy, [], fuzzy)
+
+
 # ==================== API 集成测试 ====================
 
 class TestAppsAPI(SandboxBase):
@@ -529,10 +701,10 @@ class TestAppsAPI(SandboxBase):
         resp = self.http.get("/api/apps")
         self.assertEqual(resp.status_code, 200, resp.text)
         data = resp.json()
-        self.assertEqual(data["total"], 4)
+        self.assertEqual(data["total"], 5)
         self.assertFalse(data["is_macos"])
         self.assertEqual(sorted(a["name"] for a in data["apps"]),
-                         ["Bar", "Baz", "Foo", "NoPlist"])
+                         ["Bar", "Baz", "Foo", "NoPlist", "ZZTool"])
 
         resp = self.http.get("/api/apps", params={"q": "foo"})
         self.assertEqual(resp.json()["total"], 1)
@@ -582,6 +754,20 @@ class TestAppsAPI(SandboxBase):
         for i in items:
             self.assertFalse(os.path.lexists(i["path"]))
         self.assert_decoys_intact()
+
+
+    def test_list_sort_and_alias_query(self):
+        # 默认按体积降序
+        resp = self.http.get("/api/apps")
+        sizes = [a["size"] for a in resp.json()["apps"]]
+        self.assertEqual(sizes, sorted(sizes, reverse=True))
+        # 按名称升序
+        resp = self.http.get("/api/apps", params={"sort_by": "name", "order": "asc"})
+        names = [a["name"] for a in resp.json()["apps"]]
+        self.assertEqual(names, sorted(names, key=str.lower))
+        # 中文本地化名可搜
+        resp = self.http.get("/api/apps", params={"q": "测试助手"})
+        self.assertEqual(resp.json()["total"], 1)
 
     def test_uninstall_endpoint_bad_mode(self):
         resp = self.http.post("/api/apps/uninstall", json={

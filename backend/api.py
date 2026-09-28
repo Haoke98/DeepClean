@@ -397,10 +397,12 @@ async def ai_analyze_nonstream(req: AIAnalyzeRequest):
 # ==================== 应用深度卸载 (macOS) ====================
 
 @app.get("/api/apps")
-async def list_installed_apps(q: str = "", with_sizes: bool = True):
-    """列出已安装应用(q 按名称/Bundle ID 后端过滤)"""
+async def list_installed_apps(q: str = "", with_sizes: bool = True,
+                              sort_by: str = "size", order: str = "desc"):
+    """列出已安装应用(q 按显示名/别名/Bundle ID 后端过滤; 默认按体积降序)"""
     layout = app_uninstaller.get_layout()
-    apps = await run_in_threadpool(app_uninstaller.list_apps, with_sizes, q, layout)
+    apps = await run_in_threadpool(
+        app_uninstaller.list_apps, with_sizes, q, layout, sort_by, order)
     return {
         "apps": apps,
         "total": len(apps),

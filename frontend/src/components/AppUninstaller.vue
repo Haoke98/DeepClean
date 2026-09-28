@@ -15,7 +15,7 @@
     <div class="toolbar">
       <el-input
         v-model="query"
-        placeholder="搜索应用名称 / Bundle ID"
+        placeholder="搜索应用名称 / 别名 / Bundle ID（支持中文名）"
         clearable
         :prefix-icon="Search"
         class="search-input"
@@ -37,11 +37,13 @@
         stripe
         style="width: 100%"
         empty-text="未找到应用（当前环境可能不支持）"
+        :default-sort="{ prop: 'size', order: 'descending' }"
+        @sort-change="onSortChange"
       >
-        <el-table-column label="应用" min-width="230">
+        <el-table-column label="应用" min-width="230" prop="name" sortable="custom">
           <template #default="{ row }">
             <div class="app-name">
-              <span class="name">{{ row.name }}</span>
+              <span class="name" :title="aliasTitle(row)">{{ row.name }}</span>
               <el-tag v-if="row.system" size="small" type="warning">系统应用</el-tag>
               <el-tag v-if="row.running" size="small" type="danger" effect="plain">运行中</el-tag>
             </div>
@@ -51,7 +53,7 @@
         <el-table-column label="版本" width="100">
           <template #default="{ row }">{{ row.version || '-' }}</template>
         </el-table-column>
-        <el-table-column label="大小" width="110" align="right">
+        <el-table-column label="大小" width="110" align="right" prop="size" sortable="custom">
           <template #default="{ row }">
             {{ row.size === null || row.size === undefined ? '-' : formatSize(row.size) }}
           </template>
@@ -142,6 +144,9 @@
           <div class="items-summary">
             <span>
               共找到 <b>{{ items.length }}</b> 项 · 合计 <b>{{ formatSize(itemsTotalSize) }}</b>
+              <span v-if="unselectedCount" class="fuzzy-note">
+                · {{ unselectedCount }} 项默认未勾选（疑似/需确认）
+              </span>
             </span>
             <span class="sel-info">
               已勾选 <b>{{ selected.length }}</b> 项 · 合计 <b>{{ formatSize(selectedSize) }}</b>
@@ -159,9 +164,16 @@
             @selection-change="onSelectionChange"
           >
             <el-table-column type="selection" width="42" reserve-selection />
-            <el-table-column label="分类" width="130">
+            <el-table-column label="分类" width="170">
               <template #default="{ row }">
                 <el-tag size="small" :type="categoryType(row.category)">{{ row.category }}</el-tag>
+                <el-tag
+                  v-if="row.selected === false"
+                  size="small" type="warning" effect="plain" class="status-tag"
+                  :title="row.match === 'fuzzy' ? '按关键字模糊匹配的疑似残留，需人工确认后勾选' : '该分类属于用户数据/安装包，默认不勾选'"
+                >
+                  {{ row.match === 'fuzzy' ? '疑似关联' : '默认未选' }}
+                </el-tag>
               </template>
             </el-table-column>
             <el-table-column label="大小" width="95" align="right">
@@ -290,10 +302,35 @@ const onQueryInput = () => {
   queryTimer = setTimeout(() => loadApps(), 300)
 }
 
+// 排序交给后端完成(过滤/排序均不做前端实现): 默认体积降序
+const sortBy = ref('size')
+const sortOrder = ref('desc')
+
+const onSortChange = ({ prop, order }) => {
+  let sb = 'size'
+  let so = 'desc'
+  if (order !== null && (prop === 'name' || prop === 'size')) {
+    sb = prop
+    so = order === 'ascending' ? 'asc' : 'desc'
+  }
+  // 表格 default-sort 挂载时会触发一次, 参数未变则跳过重复请求
+  if (sb === sortBy.value && so === sortOrder.value && apps.value.length) return
+  sortBy.value = sb
+  sortOrder.value = so
+  loadApps()
+}
+
+const aliasTitle = (row) => {
+  const others = (row.aliases || []).filter(a => a && a !== row.name)
+  return others.length ? `别名: ${others.join(' / ')}` : ''
+}
+
 const loadApps = async (q = query.value) => {
   loading.value = true
   try {
-    const { data } = await api.get('/api/apps', { params: { q: q || '', with_sizes: true } })
+    const { data } = await api.get('/api/apps', {
+      params: { q: q || '', with_sizes: true, sort_by: sortBy.value, order: sortOrder.value },
+    })
     apps.value = data.apps || []
     isMacos.value = !!data.is_macos
   } catch (error) {
@@ -327,6 +364,7 @@ const dialogTitle = computed(() =>
   step.value === 'done' ? '卸载结果' : `深度卸载 - ${currentApp.value?.name || ''}`)
 const itemsTotalSize = computed(() => items.value.reduce((s, i) => s + (i.size || 0), 0))
 const selectedSize = computed(() => selected.value.reduce((s, i) => s + (i.size || 0), 0))
+const unselectedCount = computed(() => items.value.filter(i => i.selected === false).length)
 
 const doneTitle = computed(() => {
   const s = resultSummary.value
@@ -386,12 +424,17 @@ const runAnalyze = async () => {
     analyzing.value = false
   }
   if (analyzeError.value || !items.value.length) return
-  // 表格在 analyzing=false 后才渲染, 等 DOM 更新完成再默认全选(深度卸载)
+  // 表格在 analyzing=false 后才渲染, 等 DOM 更新完成再按后端标记默认勾选
   await nextTick()
-  itemsTable.value?.toggleAllSelection()
-  setTimeout(() => {
-    if (!selected.value.length) itemsTable.value?.toggleAllSelection()
-  }, 80)
+  applyDefaultSelection()
+  setTimeout(applyDefaultSelection, 80)
+}
+
+// 只默认勾选强关联项(selected !== false); 疑似(模糊)/用户数据类默认不勾选
+const applyDefaultSelection = () => {
+  const table = itemsTable.value
+  if (!table) return
+  items.value.forEach(item => table.toggleRowSelection(item, item.selected !== false))
 }
 
 const onSelectionChange = (rows) => {
@@ -566,5 +609,12 @@ loadApps()
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+.fuzzy-note {
+  color: #e6a23c;
+  font-size: 12px;
+}
+.status-tag {
+  margin-left: 4px;
 }
 </style>

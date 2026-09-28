@@ -5,9 +5,12 @@ macOS 应用深度卸载 (App Deep Uninstall)
 功能:
     1. 列出 /Applications、~/Applications、/System/Applications 下的 .app 应用
        (读取 Contents/Info.plist 获取 Bundle ID / 版本, 统计应用体积, 检测运行状态);
-    2. 按 Bundle ID / 应用名在各残留目录中定位关联文件: 偏好设置、缓存、
-       应用数据、沙盒容器、群组容器、网络缓存、窗口状态、Cookie、日志、
-       崩溃报告、启动项、特权助手、安装收据(pkgutil)以及 ~/.<AppName> 隐藏配置;
+    2. 按 Bundle ID / 应用名(含 InfoPlist.strings 本地化别名)在各残留目录中
+       定位关联文件: 偏好设置、缓存、应用数据(含 CrashReporter 等二级目录)、
+       沙盒容器、群组容器、网络缓存、窗口状态、Cookie、日志、崩溃报告、启动项、
+       特权助手、安装收据(pkgutil)、Downloads 数据、安装包、系统临时缓存
+       (/private/var/folders) 以及 ~/.<AppName> 隐藏配置;
+       匹配分两层: 强关联(边界匹配, 默认勾选)与关键字模糊疑似(默认不勾选);
     3. 一键深度卸载: 可先退出运行中的进程, 再移入废纸篓(默认)或永久删除,
        系统目录(/Library、安装收据)自动提权, 并可 pkgutil --forget 忘记收据。
 
@@ -22,10 +25,12 @@ macOS 应用深度卸载 (App Deep Uninstall)
 """
 from __future__ import annotations
 
+import glob
 import logging
 import os
 import plistlib
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -55,6 +60,12 @@ CAT_LAUNCH = "启动项"
 CAT_PRIV_HELPER = "特权助手"
 CAT_RECEIPT = "安装收据"
 CAT_DOTFILE = "用户隐藏配置"
+CAT_DOWNLOAD = "应用下载数据"
+CAT_INSTALLER = "安装包"
+CAT_SYSCACHE = "系统临时缓存"
+
+# 这两类属于用户数据/安装包: 即使命中也默认不勾选, 由用户手动确认
+NOAUTO_CATEGORIES = {CAT_DOWNLOAD, CAT_INSTALLER}
 
 # 用户级残留根(相对 ~/Library) —— (相对路径, 分类)
 USER_RESIDUE_DIRS = [
@@ -114,12 +125,20 @@ class MacLayout:
     receipts_dir: str = ""                                    # pkgutil 收据目录
     trash: str = ""                                           # 废纸篓
     protected_prefixes: list = field(default_factory=list)     # 系统应用前缀(受保护)
+    var_folders: str = ""                                     # /private/var/folders(应用系统临时缓存)
+    extra_roots: list = field(default_factory=list)           # 额外残留根 [(path, category, scope)]
     is_macos: bool = IS_MACOS
 
     def residue_roots(self):
-        roots = list(self.user_residue_roots) + list(self.system_residue_roots)
+        roots = (list(self.user_residue_roots) + list(self.system_residue_roots)
+                 + list(self.extra_roots))
         if self.receipts_dir:
             roots.append((self.receipts_dir, CAT_RECEIPT, "system"))
+        # 应用的系统级临时缓存: /private/var/folders/<x>/<y>/C|T(用户所有)
+        if self.var_folders and os.path.isdir(self.var_folders):
+            for tail in ("C", "T"):
+                for sub in glob.glob(os.path.join(self.var_folders, "*", "*", tail)):
+                    roots.append((sub, CAT_SYSCACHE, "user"))
         return roots
 
 
@@ -142,6 +161,12 @@ def default_layout() -> MacLayout:
         receipts_dir="/private/var/db/receipts",
         trash=os.path.join(home, ".Trash"),
         protected_prefixes=["/System", "/Library/Apple"],
+        var_folders="/private/var/folders",
+        extra_roots=[
+            (os.path.join(home, "Downloads"), CAT_DOWNLOAD, "user"),
+            (os.path.join(os.path.dirname(os.path.normpath(home)), "Shared", "PKGgs"),
+             CAT_INSTALLER, "user"),
+        ],
         is_macos=IS_MACOS,
     )
 
@@ -166,6 +191,12 @@ def sandbox_layout(root: str) -> MacLayout:
         receipts_dir=os.path.join(root, "private", "var", "db", "receipts"),
         trash=os.path.join(home, ".Trash"),
         protected_prefixes=[os.path.join(root, "System")],
+        var_folders=os.path.join(root, "private", "var", "folders"),
+        extra_roots=[
+            (os.path.join(home, "Downloads"), CAT_DOWNLOAD, "user"),
+            (os.path.join(os.path.dirname(os.path.normpath(home)), "Shared", "PKGgs"),
+             CAT_INSTALLER, "user"),
+        ],
         is_macos=False,
     )
 
@@ -241,6 +272,148 @@ def _app_name_match(entry: str, app_name: str) -> bool:
     return False
 
 
+def _fuzzy_contains(name: str, needles) -> bool:
+    """模糊(纯包含)匹配 —— 只用于生成"疑似"候选(默认不勾选), 不要求边界"""
+    if not name:
+        return False
+    n = name.lower()
+    return any(nd in n for nd in needles)
+
+
+def _fuzzy_needles(bundle_id: str, names) -> set:
+    """构造模糊匹配关键字: 已知名称(>=4字) + Bundle ID 分段(>=7字)
+
+    - 不用完整 Bundle ID: "com.vendor.foo" 是 "com.vendor.foo2" 的子串,
+      纯包含会放过另一个应用的文件(边界匹配才能区分子串关系);
+    - 分段门槛 7 是为了排除 "vendor"/"google"/"mac"/"tool" 这类通用词的噪声。
+    """
+    needles = set()
+    for nm in names or ():
+        nm = (nm or "").strip().lower()
+        if len(nm) >= 4:
+            needles.add(nm)
+    if bundle_id:
+        for seg in re.split(r"[.\-_\s]+", bundle_id.lower()):
+            if len(seg) >= 7:
+                needles.add(seg)
+    return needles
+
+
+def _parse_strings_file(path: str) -> dict:
+    """解析 InfoPlist.strings: 兼容 plist 格式与旧式 key = "value"; 文本格式"""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return {}
+    try:
+        data = plistlib.loads(raw)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    except Exception:
+        pass
+    text = raw.decode("utf-8", "ignore")
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", "", text)
+    return dict(re.findall(r'([A-Za-z0-9_.]+)\s*=\s*"((?:[^"\\]|\\.)*)"\s*;', text))
+
+
+def _read_localized_names(app_path: str) -> dict:
+    """读取 Contents/Resources/<lang>.lproj/InfoPlist.strings → {locale: {...}}"""
+    res_dir = os.path.join(app_path, "Contents", "Resources")
+    out = {}
+    try:
+        entries = os.listdir(res_dir)
+    except OSError:
+        return out
+    for entry in entries:
+        if not entry.lower().endswith(".lproj"):
+            continue
+        p = os.path.join(res_dir, entry, "InfoPlist.strings")
+        if not os.path.isfile(p):
+            continue
+        data = _parse_strings_file(p)
+        if data:
+            out[entry[: -len(".lproj")]] = data
+    return out
+
+
+def _env_locale() -> str:
+    """当前系统语言(zh_CN / en_US...), 未设置或 C/POSIX 时返回空串"""
+    raw = (os.environ.get("LANGUAGE") or os.environ.get("LC_ALL")
+           or os.environ.get("LANG") or "")
+    base = raw.split(".")[0].strip().replace("-", "_")
+    if not base or base.upper() in ("C", "POSIX"):
+        return ""
+    return base.lower()
+
+
+def _locale_rank(locale: str) -> int:
+    """locale 优先级: 与系统语言一致(0) > 中文变体(1) > 其它(2)"""
+    loc = (locale or "").replace("-", "_").lower()
+    lang = loc.split("_")[0]
+    env = _env_locale()
+    if env and (loc == env or lang == env.split("_")[0]):
+        return 0
+    if lang == "zh":
+        return 1
+    return 2
+
+
+def _app_identity(app_path: str) -> tuple:
+    """返回 (显示名, 全部已知名称集合)
+
+    显示名优先级: 系统语言的本地化名(InfoPlist.strings, Finder 显示名) →
+    Info.plist → 其它本地化名(中文优先) → 目录名;
+    名称集合用于搜索与残留匹配 —— 例如目录名 "i4Tools" 而中文本地化名
+    "爱思助手" 时, 两者都能被搜到。
+    """
+    stem = os.path.basename(os.path.normpath(app_path))
+    if stem.lower().endswith(".app"):
+        stem = stem[:-4]
+    info = _read_info_plist(app_path)
+    localized = _read_localized_names(app_path)
+    names = {stem} if stem else set()
+    for v in (info.get("display_name"), info.get("bundle_name")):
+        if v:
+            names.add(v)
+    for locdata in localized.values():
+        for k in ("CFBundleDisplayName", "CFBundleName"):
+            v = (locdata.get(k) or "").strip()
+            if v:
+                names.add(v)
+    def _localized_pick(ranks) -> str:
+        for loc in sorted(localized, key=lambda l: (_locale_rank(l), l)):
+            if _locale_rank(loc) not in ranks:
+                continue
+            for k in ("CFBundleDisplayName", "CFBundleName"):
+                v = (localized[loc].get(k) or "").strip()
+                if v:
+                    return v
+        return ""
+
+    # 显示名优先级: 系统语言的本地化名(Finder 显示名) → Info.plist
+    #             → 其它本地化名(中文优先) → 目录名
+    display = _localized_pick({0})
+    if not display:
+        display = (info.get("display_name") or info.get("bundle_name")
+                   or info.get("plist_name"))
+    if not display:
+        display = _localized_pick({1, 2})
+    if not display:
+        display = stem
+    return display, names
+
+
+def _collect_app_names(app_path: str) -> set:
+    """应用全部已知名称(出错时退回目录名)"""
+    try:
+        return _app_identity(app_path)[1]
+    except Exception:
+        stem = os.path.basename(os.path.normpath(app_path))
+        return {stem[:-4] if stem.lower().endswith(".app") else stem}
+
+
 def _size_of(path: str) -> int:
     """文件/目录(含符号链接本体)占用字节数; 出错返回 0"""
     try:
@@ -277,6 +450,8 @@ def _read_info_plist(app_path: str) -> dict:
     return {
         "bundle_id": str(data.get("CFBundleIdentifier") or ""),
         "version": str(data.get("CFBundleShortVersionString") or data.get("CFBundleVersion") or ""),
+        "display_name": str(data.get("CFBundleDisplayName") or ""),
+        "bundle_name": str(data.get("CFBundleName") or ""),
         "plist_name": str(data.get("CFBundleDisplayName") or data.get("CFBundleName") or ""),
         "executable": str(data.get("CFBundleExecutable") or ""),
     }
@@ -348,9 +523,17 @@ def _matching_pids(snaps: list, app_path: str) -> list:
 
 # ==================== 1. 应用列表 ====================
 
-def list_apps(with_sizes: bool = True, q: str = "", layout: MacLayout | None = None) -> list:
-    """列出已安装应用; q 按名称/Bundle ID 过滤(后端过滤)"""
+def list_apps(with_sizes: bool = True, q: str = "", layout: MacLayout | None = None,
+              sort_by: str = "size", order: str = "desc") -> list:
+    """列出已安装应用; q 按显示名/别名(含本地化名)/Bundle ID 过滤(后端过滤)
+
+    sort_by: size(默认,按体积) | name; order: desc(默认,降序) | asc
+    """
     layout = layout or get_layout()
+    if sort_by not in ("size", "name"):
+        sort_by = "size"
+    if order not in ("asc", "desc"):
+        order = "desc"
     snaps = _snapshot_processes()
     apps = []
     seen = set()
@@ -359,11 +542,11 @@ def list_apps(with_sizes: bool = True, q: str = "", layout: MacLayout | None = N
         if key in seen:
             continue
         seen.add(key)
-        stem = os.path.basename(key)
-        stem = stem[:-4] if stem.lower().endswith(".app") else stem
         info = _read_info_plist(key)
+        display, aliases = _app_identity(key)
         apps.append({
-            "name": info.get("plist_name") or stem,
+            "name": display,
+            "aliases": sorted(aliases),
             "path": key,
             "bundle_id": info.get("bundle_id", ""),
             "version": info.get("version", ""),
@@ -372,22 +555,53 @@ def list_apps(with_sizes: bool = True, q: str = "", layout: MacLayout | None = N
             "running": bool(_matching_pids(snaps, key)),
             "size": _size_of(key) if with_sizes else None,
         })
+    # 先按名称稳定排序再按目标键排(体积默认降序, 并列时保持名称升序)
     apps.sort(key=lambda a: (a["name"] or "").lower())
+    if sort_by == "size":
+        apps.sort(key=lambda a: a["size"] or 0, reverse=(order != "asc"))
+    else:
+        apps.sort(key=lambda a: (a["name"] or "").lower(), reverse=(order == "desc"))
     if q:
         needle = q.strip().lower()
         apps = [a for a in apps
-                if needle in (a["name"] or "").lower() or needle in (a["bundle_id"] or "").lower()]
+                if needle in (a["name"] or "").lower()
+                or needle in (a["bundle_id"] or "").lower()
+                or any(needle in (al or "").lower() for al in a["aliases"])]
     return apps
 
 
 # ==================== 2. 残留分析 ====================
 
 def find_residue(layout: MacLayout, bundle_id: str, app_name: str, app_path: str = "") -> list:
-    """在各残留根下定位与该应用关联的文件/目录(不含应用本体)"""
+    """在各残留根下定位与该应用关联的文件/目录(不含应用本体)
+
+    匹配分两层:
+    - 强关联(bundle_id/name 边界匹配) → selected=True, 默认勾选;
+    - 疑似(关键字纯包含, 如 "i4ToolsDownloads" 命中 i4Tools) → selected=False,
+      仅列出供用户确认, 默认不勾选。
+    """
     items: list = []
     seen: set = set()
     app_norm = os.path.normpath(os.path.abspath(app_path)) if app_path else ""
     trash_norm = os.path.normpath(os.path.abspath(layout.trash)) if layout.trash else ""
+
+    names: set = {app_name} if app_name else set()
+    if app_norm and os.path.isdir(app_norm):
+        names |= _collect_app_names(app_norm)
+    names = {n for n in names if n}
+    fuzzy = _fuzzy_needles(bundle_id, names)
+
+    def _tier(name: str, category: str):
+        if bundle_id and _boundary_match(name, bundle_id):
+            return "bundle_id"
+        if category == CAT_RECEIPT:
+            return None  # 安装收据只按 Bundle ID 匹配
+        for nm in names:
+            if _app_name_match(name, nm):
+                return "name"
+        if fuzzy and _fuzzy_contains(name, fuzzy):
+            return "fuzzy"
+        return None
 
     def _add(path: str, category: str, scope: str, match: str) -> None:
         try:
@@ -410,40 +624,54 @@ def find_residue(layout: MacLayout, bundle_id: str, app_name: str, app_path: str
             "type": "dir" if (os.path.isdir(path) and not os.path.islink(path)) else "file",
             "size": _size_of(path),
             "match": match,
-            "selected": True,
+            "selected": match != "fuzzy" and category not in NOAUTO_CATEGORIES,
         })
 
-    for root, category, scope in layout.residue_roots():
+    def _scan(root: str, category: str, scope: str) -> None:
+        """扫一层; 应用数据目录额外扫第二层(如 Application Support/CrashReporter/)"""
         if not os.path.isdir(root):
-            continue
+            return
         try:
-            names = sorted(os.listdir(root))
+            entries = sorted(os.listdir(root))
         except OSError:
-            continue
+            return
         root_base = os.path.basename(os.path.normpath(root))
-        for name in names:
+        unmatched_dirs = []
+        for name in entries:
             if name.startswith("."):
                 continue
             if name == root_base:
                 continue  # 不允许命中根目录自身
-            match = None
-            if bundle_id and _boundary_match(name, bundle_id):
-                match = "bundle_id"
-            elif category == CAT_RECEIPT:
-                # 安装收据只按 Bundle ID 匹配, 防止应用名恰为 "receipts" 时误删整个目录
-                continue
-            elif _app_name_match(name, app_name):
-                match = "name"
+            match = _tier(name, category)
             if match:
                 _add(os.path.join(root, name), category, scope, match)
+            elif category == CAT_SUPPORT and os.path.isdir(os.path.join(root, name)):
+                unmatched_dirs.append(name)
+        if category == CAT_SUPPORT:
+            # 第一层已命中的目录整体删除即可, 不再把其子文件列成独立项
+            for sub in unmatched_dirs:
+                sub_path = os.path.join(root, sub)
+                try:
+                    sub_entries = sorted(os.listdir(sub_path))
+                except OSError:
+                    continue
+                for name in sub_entries:
+                    if name.startswith("."):
+                        continue
+                    match = _tier(name, category)
+                    if match:
+                        _add(os.path.join(sub_path, name), category, scope, match)
 
-    # ~/.<AppName> 形式的用户隐藏配置
+    for root, category, scope in layout.residue_roots():
+        _scan(root, category, scope)
+
+    # ~/.<AppName> 形式的用户隐藏配置(仅精确/边界匹配, 不做模糊)
     try:
         for name in sorted(os.listdir(layout.home)):
             if not name.startswith("."):
                 continue
             inner = name[1:]
-            if _app_name_match(inner, app_name):
+            if any(_app_name_match(inner, nm) for nm in names):
                 _add(os.path.join(layout.home, name), CAT_DOTFILE, "user", "name")
     except OSError:
         pass
@@ -463,12 +691,11 @@ def analyze_app(app_path: str, layout: MacLayout | None = None) -> dict:
 
     info = _read_info_plist(norm)
     bundle_id = info.get("bundle_id", "")
-    stem = os.path.basename(norm)
-    stem = stem[:-4] if stem.lower().endswith(".app") else stem
+    app_name, aliases = _app_identity(norm)
 
     snaps = _snapshot_processes()
     pids = _matching_pids(snaps, norm)
-    items = find_residue(layout, bundle_id, stem, norm)
+    items = find_residue(layout, bundle_id, app_name, norm)
 
     system = _is_protected(layout, norm)
     items.insert(0, {
@@ -487,6 +714,10 @@ def analyze_app(app_path: str, layout: MacLayout | None = None) -> dict:
     warnings = []
     if not bundle_id:
         warnings.append("未能读取 Bundle ID, 残留文件仅按应用名匹配, 可能不完整")
+    fuzzy_items = [i for i in items if i.get("match") == "fuzzy"]
+    if fuzzy_items:
+        warnings.append(f"另有 {len(fuzzy_items)} 项按关键字模糊匹配的疑似残留, "
+                        f"已默认取消勾选, 请确认后再删除")
     if pids:
         warnings.append(f"应用正在运行({len(pids)} 个相关进程), 卸载前将尝试退出")
     if system:
@@ -494,7 +725,8 @@ def analyze_app(app_path: str, layout: MacLayout | None = None) -> dict:
 
     return {
         "app": {
-            "name": stem,
+            "name": app_name,
+            "aliases": sorted(aliases),
             "path": norm,
             "bundle_id": bundle_id,
             "version": info.get("version", ""),
@@ -520,7 +752,8 @@ def _valid_app_path(layout: MacLayout, path: str) -> bool:
 
 
 def validate_target(layout: MacLayout, path: str, *, app_path: str = "",
-                    bundle_id: str = "", app_name: str = "") -> tuple:
+                    bundle_id: str = "", app_name: str = "",
+                    aliases=None) -> tuple:
     """删除前校验单个目标: 返回 (是否合法, 说明)"""
     if not path or not str(path).strip():
         return False, "路径为空"
@@ -538,6 +771,16 @@ def validate_target(layout: MacLayout, path: str, *, app_path: str = "",
 
     name = os.path.basename(norm)
 
+    # 已知名称(含本地化别名)与模糊关键字 —— 服务端从应用包自行派生, 不信任客户端
+    names = set()
+    if app_name:
+        names.add(app_name)
+    if aliases:
+        names.update(a for a in aliases if a)
+    if app_path and os.path.isdir(app_path):
+        names |= _collect_app_names(app_path)
+    fuzzy = _fuzzy_needles(bundle_id, names)
+
     # 必须位于允许的残留根之下, 且符号链接解析后仍在该根之内
     for root, category, _scope in layout.residue_roots():
         if not _is_under(norm, root):
@@ -551,8 +794,10 @@ def validate_target(layout: MacLayout, path: str, *, app_path: str = "",
             return False, "安装收据目录仅允许按 Bundle ID 匹配"
         if bundle_id and _boundary_match(name, bundle_id):
             return True, "Bundle ID 匹配"
-        if _app_name_match(name, app_name):
+        if any(_app_name_match(name, nm) for nm in names):
             return True, "应用名匹配"
+        if fuzzy and _fuzzy_contains(name, fuzzy):
+            return True, "关键字模糊匹配(用户手动勾选)"
         return False, "名称与该应用不匹配"
 
     # ~/.<AppName> 用户隐藏配置
@@ -560,7 +805,7 @@ def validate_target(layout: MacLayout, path: str, *, app_path: str = "",
         real = os.path.realpath(norm)
         if not _is_under(real, os.path.realpath(layout.home)):
             return False, "经由符号链接指向允许范围之外"
-        if _app_name_match(name[1:], app_name):
+        if any(_app_name_match(name[1:], nm) for nm in names):
             return True, "用户隐藏配置匹配"
         return False, "名称与该应用不匹配"
 
@@ -761,10 +1006,16 @@ def uninstall_app(app_path: str, paths: list, *, bundle_id: str = "", app_name: 
         raise InvalidAppPathError(f"应用路径不在允许的应用目录内: {app_path}")
 
     # ① 预校验: 只要有一个目标不合法, 整体拒绝
+    aliases = set()
+    if app_name:
+        aliases.add(app_name)
+    if norm_app and os.path.isdir(norm_app):
+        aliases |= _collect_app_names(norm_app)
     rejected = []
     for p in paths:
         ok, reason = validate_target(layout, p, app_path=norm_app,
-                                     bundle_id=bundle_id, app_name=app_name)
+                                     bundle_id=bundle_id, app_name=app_name,
+                                     aliases=aliases)
         if not ok:
             rejected.append({"path": str(p), "reason": reason})
     if rejected:
