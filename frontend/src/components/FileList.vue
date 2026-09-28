@@ -1,82 +1,5 @@
 <template>
   <div class="file-manager">
-    <div class="monitor-grid">
-      <!-- 磁盘使用情况 -->
-      <el-card>
-        <template #header>
-          <div class="monitor-header">
-            <span>磁盘使用情况</span>
-          </div>
-        </template>
-        <el-progress 
-          type="dashboard"
-          :percentage="systemStatus.disk.percent || 0"
-          :color="getColorByPercentage(systemStatus.disk.percent)"
-        >
-          <template #default="{ percentage }">
-            <div class="progress-content">
-              <div>{{ percentage.toFixed(1) }}%</div>
-              <div class="usage-details">
-                <div>已用: {{ formatSize(systemStatus.disk.used) }}</div>
-                <div>可用: {{ formatSize(systemStatus.disk.free) }}</div>
-                <div>总计: {{ formatSize(systemStatus.disk.total) }}</div>
-              </div>
-            </div>
-          </template>
-        </el-progress>
-      </el-card>
-
-      <!-- 内存使用情况 -->
-      <el-card>
-        <template #header>
-          <div class="monitor-header">
-            <span>内存使用情况</span>
-          </div>
-        </template>
-        <el-progress 
-          type="dashboard"
-          :percentage="systemStatus.memory.percent || 0"
-          :color="getColorByPercentage(systemStatus.memory.percent)"
-        >
-          <template #default="{ percentage }">
-            <div class="progress-content">
-              <div>{{ percentage.toFixed(1) }}%</div>
-              <div class="usage-details">
-                <div>已用: {{ formatSize(systemStatus.memory.used) }}</div>
-                <div>可用: {{ formatSize(systemStatus.memory.free) }}</div>
-                <div>总计: {{ formatSize(systemStatus.memory.total) }}</div>
-              </div>
-            </div>
-          </template>
-        </el-progress>
-      </el-card>
-
-      <!-- 交换内存使用情况 -->
-      <el-card>
-        <template #header>
-          <div class="monitor-header">
-            <span>交换内存使用情况</span>
-          </div>
-        </template>
-        <el-progress 
-          type="dashboard"
-          :percentage="systemStatus.swap.percent || 0"
-          :color="getColorByPercentage(systemStatus.swap.percent)"
-        >
-          <template #default="{ percentage }">
-            <div class="progress-content">
-              <div>{{ percentage.toFixed(1) }}%</div>
-              <div class="usage-details">
-                <div>已用: {{ formatSize(systemStatus.swap.used) }}</div>
-                <div>可用: {{ formatSize(systemStatus.swap.free) }}</div>
-                <div>总计: {{ formatSize(systemStatus.swap.total) }}</div>
-              </div>
-            </div>
-          </template>
-        </el-progress>
-      </el-card>
-    </div>
-
     <!-- 控制栏 -->
     <div class="controls">
       <el-select v-model="scanPath" placeholder="选择扫描路径" class="path-select">
@@ -256,28 +179,6 @@ const api = axios.create({
   withCredentials: true
 })
 
-const systemStatus = ref({
-  disk: { total: 0, used: 0, free: 0, percent: 0 },
-  memory: { total: 0, used: 0, free: 0, percent: 0 },
-  swap: { total: 0, used: 0, free: 0, percent: 0 }
-})
-
-const getColorByPercentage = (percent) => {
-  if (percent < 60) return '#67C23A'
-  if (percent < 80) return '#E6A23C'
-  return '#F56C6C'
-}
-
-const updateSystemStatus = async () => {
-  try {
-    const { data } = await api.get('/api/monitor')
-    systemStatus.value = data
-  } catch (error) {
-    console.error('Failed to get system status:', error)
-    ElMessage.error('获取系统状态失败')
-  }
-}
-
 const scanning = ref(false)
 const scanProgress = ref(0)
 const scannedDirs = ref(0)
@@ -381,6 +282,7 @@ const handleAction = async (action, file) => {
     
     if (action === 'delete') {
       await loadFiles()
+      window.dispatchEvent(new CustomEvent('deepclean:deleted'))  // 通知 Dashboard 刷新
       ElMessage.success('删除成功')
     }
   } catch (error) {
@@ -398,13 +300,9 @@ const openAiDialog = (file) => {
   aiDialogVisible.value = true
 }
 
-// 组件挂载时启动定时器
 onMounted(() => {
   loadFiles()
-  updateSystemStatus()
   resumeIfScanning()
-  // 每5秒更新一次系统状态
-  setInterval(updateSystemStatus, 5000)
 })
 </script>
 
@@ -434,26 +332,4 @@ onMounted(() => {
   box-shadow: 0 2px 12px 0 rgba(0,0,0,0.1);
 }
 
-.monitor-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-  gap: 20px;
-  margin-bottom: 20px;
-}
-
-.monitor-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.progress-content {
-  text-align: center;
-}
-
-.usage-details {
-  margin-top: 10px;
-  font-size: 12px;
-  color: #666;
-}
 </style> 

@@ -500,6 +500,7 @@ const confirmAndUninstall = async () => {
     results.value = data.results || []
     resultSummary.value = data
     step.value = 'done'
+    window.dispatchEvent(new CustomEvent('deepclean:deleted'))  // 通知 Dashboard 刷新统计
     if (data.status === 'partial') {
       ElMessage.warning('部分目标删除失败，详见结果列表')
     }

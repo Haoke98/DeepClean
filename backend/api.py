@@ -16,6 +16,8 @@ from utils import logger
 from exceptions import DirectoryNotExistError
 import ai_service
 import app_uninstaller
+import history as hist
+import orphan_sweeper
 import json
 
 logger.init('DeepClean-api', console_level=logging.DEBUG)
@@ -67,6 +69,12 @@ class AIConfigRequest(BaseModel):
     temperature: float = 0.3
     max_tokens: int = 2000
     timeout: int = 60
+
+
+class OrphanDeleteRequest(BaseModel):
+    paths: list[str]
+    mode: str = "trash"
+    forget_receipts: bool = True
 
 
 class AppUninstallRequest(BaseModel):
@@ -171,6 +179,8 @@ async def file_action(action: str, file_data: FileAction):
     elif action == "reveal":
         subprocess.run(["open", "-R", full_path])
     elif action == "delete":
+        # 先量尺寸再删(删除后无法回读), 用于历史统计"腾出多大空间"
+        size = app_uninstaller._size_of(full_path)
         if os.path.isdir(full_path):
             # 删除非空目录
             shutil.rmtree(full_path)
@@ -178,6 +188,11 @@ async def file_action(action: str, file_data: FileAction):
             os.remove(full_path)
         # 从 scanner 的文件列表中移除已删除的文件
         scanner.large_files = [f for f in scanner.large_files if f['path'] != full_path]
+        try:
+            hist.record("file_scan", "permanent",
+                        [{"path": full_path, "size": size}])
+        except Exception as e:  # 落账失败不影响删除结果
+            logging.error("删除历史落账失败: %s", e)
 
     return {"status": "success"}
 
@@ -428,8 +443,20 @@ async def analyze_installed_app(path: str):
 async def uninstall_installed_app(req: AppUninstallRequest):
     """执行深度卸载: 后端会对每个目标做独立复核, 任一目标不合法则整体拒绝"""
     layout = app_uninstaller.get_layout()
+    # 卸载前采集应用身份(含本地化别名) —— 卸载后应用已不存在,
+    # 这些名称是以后"残留追踪"识别其漏网残留的唯一线索
+    app_meta = {"name": req.app_name, "bundle_id": req.bundle_id,
+                "path": req.app_path, "aliases": []}
+    if req.app_path and os.path.isdir(req.app_path):
+        try:
+            display, aliases = app_uninstaller._app_identity(req.app_path)
+            app_meta = {"name": req.app_name or display, "bundle_id": req.bundle_id,
+                        "path": req.app_path, "aliases": sorted(aliases)}
+        except Exception as e:
+            logging.warning("采集应用身份失败(不影响卸载): %s", e)
+    norm_app = os.path.normpath(os.path.abspath(req.app_path)) if req.app_path else ""
     try:
-        return await run_in_threadpool(
+        result = await run_in_threadpool(
             app_uninstaller.uninstall_app,
             req.app_path,
             req.paths,
@@ -449,3 +476,77 @@ async def uninstall_installed_app(req: AppUninstallRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    # 落账历史(成功/部分成功都记; 整体拒绝的异常路径在此之上已抛出, 没删任何文件)
+    try:
+        items = [
+            {"path": r["path"], "size": r.get("size") or 0,
+             "category": "应用本体" if r["path"] == norm_app else ""}
+            for r in result.get("results", [])
+            if r.get("status") in ("trashed", "deleted")
+        ]
+        hist.record("app_uninstall", req.mode, items, app=app_meta,
+                    ok=result.get("status") == "success",
+                    detail="" if result.get("status") == "success" else "部分目标删除失败")
+    except Exception as e:
+        logging.error("卸载历史落账失败: %s", e)
+    return result
+
+
+# ==================== 删除历史与贡献统计 ====================
+
+@app.get("/api/history")
+async def get_history(limit: int = 50, offset: int = 0, source: str = ""):
+    """删除历史(最新在前; source=file_scan|app_uninstall|orphan_residue)"""
+    return await run_in_threadpool(hist.list_records, limit, offset, source)
+
+
+@app.get("/api/history/stats")
+async def get_history_stats():
+    """贡献统计: 操作次数/条目数/释放空间/卸载应用数/清理残留数"""
+    return await run_in_threadpool(hist.stats)
+
+
+@app.delete("/api/history")
+async def clear_history():
+    n = await run_in_threadpool(hist.clear)
+    return {"status": "success", "cleared": n}
+
+
+# ==================== 无主残留(已删除目标的残留) ====================
+
+@app.get("/api/orphans/scan")
+async def scan_orphan_residue():
+    """扫描『已删除应用/文件』遗留的无主残留(证据分级, 强证据默认勾选)"""
+    layout = app_uninstaller.get_layout()
+    return await run_in_threadpool(orphan_sweeper.scan, layout)
+
+
+@app.post("/api/orphans/delete")
+async def delete_orphan_residue(req: OrphanDeleteRequest):
+    """清理无主残留: 整体校验(任一不合法则整体拒绝), 落账历史"""
+    layout = app_uninstaller.get_layout()
+    try:
+        result = await run_in_threadpool(
+            orphan_sweeper.delete_orphans, req.paths, req.mode, layout, req.forget_receipts)
+    except app_uninstaller.UnsafePathError as e:
+        raise HTTPException(status_code=400, detail={
+            "message": "存在不合法的清理目标, 已整体拒绝执行(未删除任何文件)",
+            "rejected": e.rejected,
+        })
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        items = [
+            {"path": r["path"], "size": r.get("size") or 0,
+             "category": r.get("category") or ""}
+            for r in result.get("results", [])
+            if r.get("status") in ("trashed", "deleted")
+        ]
+        hist.record("orphan_residue", req.mode, items,
+                    ok=result.get("status") == "success",
+                    detail="" if result.get("status") == "success" else "部分目标删除失败")
+    except Exception as e:
+        logging.error("残留清理历史落账失败: %s", e)
+    return result
