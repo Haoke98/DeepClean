@@ -1,6 +1,6 @@
 {
   "name": "deepfc-ui",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Deep File Cleaner UI",
   "main": "electron/main.js",
   "scripts": {
